@@ -141,7 +141,7 @@ def test_invalid_signed_audio_url_rejected(client):
 
 
 def test_split_text_for_tts_caps_parts_and_preserves_exact_text():
-    source = ("第一段。" * 1700) + "\\n\\n" + ("第二段。" * 1700) + ("第三段。" * 1700)
+    source = ("第一段。" * 1700) + "\n\n" + ("第二段。" * 1700) + ("第三段。" * 1700)
     chunks = main.split_text_for_tts(source, max_chars=5000)
     assert len(chunks) >= 3
     assert all(len(chunk) <= 5000 for chunk in chunks)
