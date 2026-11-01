@@ -196,6 +196,10 @@ def test_long_job_runs_100_segments_in_parallel_and_merges_in_source_order(clien
     assert data["completed_chunks"] == 100
     assert data["progress_percent"] == 100
     assert peak_active == 100
+    assert len(data["segments"]) == 100
+    assert [segment["index"] for segment in data["segments"]] == list(range(1, 101))
+    assert all(segment["status"] == "completed" for segment in data["segments"])
+    assert all(segment["char_count"] == 5000 for segment in data["segments"])
 
     audio = client.get(data["audio_url"])
     assert audio.status_code == 200
