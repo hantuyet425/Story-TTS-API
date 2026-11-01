@@ -267,7 +267,7 @@ def split_text_for_tts(text: str, max_chars: int = TTS_CHUNK_CHAR_LIMIT) -> list
     parts: list[str] = []
     start = 0
     length = len(text)
-    preferred = ("\\n\\n", "\\n", "。", "！", "？", "!", "?", ".", "；", ";", "，", ",", " ")
+    preferred = ("\n\n", "\n", "。", "！", "？", "!", "?", ".", "；", ";", "，", ",", " ")
     while start < length:
         hard_end = min(start + max_chars, length)
         if hard_end == length:
