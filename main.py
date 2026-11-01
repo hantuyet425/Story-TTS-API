@@ -112,7 +112,7 @@ def init_database() -> None:
         con.execute(
             """UPDATE jobs
                SET status='queued', updated_at=?, chunk_count=0, completed_chunks=0
-               WHERE status='generating'""",
+               WHERE status IN ('generating', 'merging')""",
             (utc_now(),),
         )
 
