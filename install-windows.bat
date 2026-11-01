@@ -25,7 +25,7 @@ if errorlevel 1 (
   exit /b 1
 )
 if not exist .env (
-  python -c "import secrets; from pathlib import Path; Path('.env').write_text('TTS_API_KEY='+secrets.token_urlsafe(48)+'\nAUDIO_URL_SECRET='+secrets.token_urlsafe(48)+'\nTTS_DATA_DIR=./data\nTTS_CHUNK_CHAR_LIMIT=5000\nMAX_PARALLEL_CHUNKS=4\nMAX_INPUT_CHARACTERS=5000000\nMAX_QUEUED_JOBS=50\nAUDIO_URL_TTL_SECONDS=86400\n',encoding='utf-8')"
+  python -c "import secrets; from pathlib import Path; Path('.env').write_text('TTS_API_KEY='+secrets.token_urlsafe(48)+'\nAUDIO_URL_SECRET='+secrets.token_urlsafe(48)+'\nTTS_DATA_DIR=./data\nTTS_CHUNK_CHAR_LIMIT=5000\nMAX_PARALLEL_CHUNKS=100\nMAX_INPUT_CHARACTERS=5000000\nMAX_QUEUED_JOBS=50\nAUDIO_URL_TTL_SECONDS=86400\n',encoding='utf-8')"
   echo Da tao .env va tu sinh API key rieng tren may nay.
 )
 echo.
