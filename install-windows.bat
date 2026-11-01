@@ -29,5 +29,11 @@ if not exist .env (
   echo Da tao .env va tu sinh API key rieng tren may nay.
 )
 echo.
+for /f "tokens=1,* delims==" %%A in ('findstr /b "TTS_API_KEY=" .env') do set "LOCAL_TTS_API_KEY=%%B"
+echo ========================================
+echo API KEY RIENG CUA MAY NAY - HAY COPY VAO SANH TRUYEN:
+echo %LOCAL_TTS_API_KEY%
+echo Khong gui key nay cho nguoi khac va khong commit file .env.
+echo ========================================
 echo Cai dat xong. Chay run-windows.bat de mo Story TTS API.
 pause
