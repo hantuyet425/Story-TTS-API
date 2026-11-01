@@ -24,6 +24,9 @@ logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 logger = logging.getLogger("story-tts-api")
 
 BASE_DIR = Path(__file__).resolve().parent
+from dotenv import load_dotenv
+
+load_dotenv(BASE_DIR / ".env")
 DATA_DIR = Path(os.getenv("TTS_DATA_DIR", str(BASE_DIR / "data"))).expanduser().resolve()
 AUDIO_DIR = DATA_DIR / "audio"
 DB_PATH = DATA_DIR / "jobs.sqlite3"
