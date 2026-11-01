@@ -132,6 +132,19 @@ python main.py
 
 Open \`http://127.0.0.1:8000/docs\`.
 
+### Windows one-click local setup
+
+1. Download this repository as ZIP and extract it.
+2. Install Python 3.11 64-bit with **Add Python to PATH** enabled.
+3. Double-click \`install-windows.bat\`. It creates \`.venv\`, installs dependencies and creates a local \`.env\` with random API secrets. The real \`.env\` is ignored by Git.
+4. Copy the \`TTS_API_KEY\` printed at the end of setup. In SẢNH TRUYỆN → Tạo Audio, use URL \`http://127.0.0.1:8000\` and paste that key, then choose **LƯU & KIỂM TRA**.
+5. Double-click \`run-windows.bat\`. Keep its console window open while SẢNH TRUYỆN is generating audio.
+6. Open the API docs at \`http://127.0.0.1:8000/docs\` to inspect the local service.
+
+Run the API and SẢNH TRUYỆN on the same Windows PC. The desktop app sends chapter text to the local HTTP API; the API processes it and returns one MP3 per chapter. No Edge-TTS engine is bundled inside SẢNH TRUYỆN.
+
+
+
 ## Deploy on Render
 
 This repository includes \`render.yaml\`. In Render choose **New → Blueprint**, connect this repo, and review the resources before deployment. The blueprint provides a persistent disk for SQLite job state and MP3 cache, generates \`TTS_API_KEY\` and \`AUDIO_URL_SECRET\`, and asks you to configure \`ALLOWED_ORIGINS\` to the exact origin(s) of your website (comma-separated, no trailing slash). After deployment:
