@@ -137,3 +137,59 @@ def test_same_pending_request_is_reused(client, monkeypatch):
 def test_invalid_signed_audio_url_rejected(client):
     response = client.get("/v1/jobs/5/audio?expires=9999999999&token=" + ("a" * 64))
     assert response.status_code == 403
+
+
+
+def test_split_text_for_tts_caps_parts_and_preserves_exact_text():
+    source = ("第一段。" * 1700) + "\\n\\n" + ("第二段。" * 1700) + ("第三段。" * 1700)
+    chunks = main.split_text_for_tts(source, max_chars=5000)
+    assert len(chunks) >= 3
+    assert all(len(chunk) <= 5000 for chunk in chunks)
+    assert "".join(chunks) == source
+
+
+def test_long_job_runs_four_segments_in_parallel_and_merges_in_source_order(client, monkeypatch):
+    monkeypatch.setattr(main, "MAX_PARALLEL_CHUNKS", 4)
+    monkeypatch.setattr(main, "TTS_CHUNK_CHAR_LIMIT", 5000)
+    active = 0
+    peak_active = 0
+
+    async def fake_synthesize(text, voice, rate, output):
+        nonlocal active, peak_active
+        active += 1
+        peak_active = max(peak_active, active)
+        try:
+            # Different delays force completion order to differ from source order.
+            await asyncio.sleep({"A": 0.12, "B": 0.08, "C": 0.04, "D": 0.01}[text[0]])
+            output.parent.mkdir(parents=True, exist_ok=True)
+            output.write_bytes(text[0].encode("ascii") * 200)
+        finally:
+            active -= 1
+
+    monkeypatch.setattr(main, "synthesize_to_file", fake_synthesize)
+    headers = {"Authorization": "Bearer test-secret-token"}
+    source = "A" * 5000 + "B" * 5000 + "C" * 5000 + "D" * 5000
+    response = client.post("/v1/tts", headers=headers, json={
+        "text": source, "voice": "vi-VN-NamMinhNeural", "rate": 1.0
+    })
+    assert response.status_code == 202
+    job_id = response.json()["job_id"]
+
+    deadline = monotonic() + 5
+    result = None
+    while monotonic() < deadline:
+        result = client.get(f"/v1/jobs/{job_id}", headers=headers)
+        if result.status_code == 200 and result.json()["status"] in {"completed", "failed"}:
+            break
+        sleep(0.02)
+
+    assert result is not None and result.json()["status"] == "completed"
+    data = result.json()
+    assert data["chunk_count"] == 4
+    assert data["completed_chunks"] == 4
+    assert data["progress_percent"] == 100
+    assert peak_active == 4
+
+    audio = client.get(data["audio_url"])
+    assert audio.status_code == 200
+    assert audio.content == (b"A" * 200) + (b"B" * 200) + (b"C" * 200) + (b"D" * 200)
