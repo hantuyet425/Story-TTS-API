@@ -4,15 +4,22 @@ cd /d "%~dp0"
 echo ========================================
 echo       CAI DAT STORY TTS API
 echo ========================================
-where py >nul 2>nul
-if errorlevel 1 (
-  echo Khong tim thay Python Launcher. Hay cai Python 3.11 x64 va danh dau Add Python to PATH.
-  pause
-  exit /b 1
+where pymanager >nul 2>nul
+if not errorlevel 1 (
+  echo Su dung Python Install Manager de tao moi truong Python 3.11...
+  pymanager exec -V:3.11 -m venv .venv
+) else (
+  where py >nul 2>nul
+  if errorlevel 1 (
+    echo Khong tim thay Python Install Manager hoac Python Launcher.
+    echo Hay cai Python Install Manager va runtime 3.11 truoc.
+    pause
+    exit /b 1
+  )
+  py -3.11 -m venv .venv
 )
-py -3.11 -m venv .venv
 if errorlevel 1 (
-  echo Khong tao duoc moi truong Python. Kiem tra Python 3.11 x64.
+  echo Khong tao duoc moi truong Python 3.11. Kiem tra lai Python.
   pause
   exit /b 1
 )
