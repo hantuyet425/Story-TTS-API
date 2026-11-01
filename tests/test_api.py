@@ -148,8 +148,16 @@ def test_split_text_for_tts_caps_parts_and_preserves_exact_text():
     assert "".join(chunks) == source
 
 
-def test_long_job_runs_four_segments_in_parallel_and_merges_in_source_order(client, monkeypatch):
-    monkeypatch.setattr(main, "MAX_PARALLEL_CHUNKS", 4)
+def test_parallel_chunk_limit_is_clamped_to_100():
+    assert main.parallel_chunk_limit("1") == 1
+    assert main.parallel_chunk_limit("4") == 4
+    assert main.parallel_chunk_limit("100") == 100
+    assert main.parallel_chunk_limit("250") == 100
+    assert main.parallel_chunk_limit("0") == 1
+
+
+def test_long_job_runs_100_segments_in_parallel_and_merges_in_source_order(client, monkeypatch):
+    monkeypatch.setattr(main, "MAX_PARALLEL_CHUNKS", 100)
     monkeypatch.setattr(main, "TTS_CHUNK_CHAR_LIMIT", 5000)
     active = 0
     peak_active = 0
@@ -159,8 +167,7 @@ def test_long_job_runs_four_segments_in_parallel_and_merges_in_source_order(clie
         active += 1
         peak_active = max(peak_active, active)
         try:
-            # Different delays force completion order to differ from source order.
-            await asyncio.sleep({"A": 0.12, "B": 0.08, "C": 0.04, "D": 0.01}[text[0]])
+            await asyncio.sleep(0.05)
             output.parent.mkdir(parents=True, exist_ok=True)
             output.write_bytes(text[0].encode("ascii") * 200)
         finally:
@@ -168,14 +175,14 @@ def test_long_job_runs_four_segments_in_parallel_and_merges_in_source_order(clie
 
     monkeypatch.setattr(main, "synthesize_to_file", fake_synthesize)
     headers = {"Authorization": "Bearer test-secret-token"}
-    source = "A" * 5000 + "B" * 5000 + "C" * 5000 + "D" * 5000
+    source = "".join(chr(65 + (index % 26)) * 5000 for index in range(100))
     response = client.post("/v1/tts", headers=headers, json={
         "text": source, "voice": "vi-VN-NamMinhNeural", "rate": 1.0
     })
     assert response.status_code == 202
     job_id = response.json()["job_id"]
 
-    deadline = monotonic() + 5
+    deadline = monotonic() + 15
     result = None
     while monotonic() < deadline:
         result = client.get(f"/v1/jobs/{job_id}", headers=headers)
@@ -185,11 +192,12 @@ def test_long_job_runs_four_segments_in_parallel_and_merges_in_source_order(clie
 
     assert result is not None and result.json()["status"] == "completed"
     data = result.json()
-    assert data["chunk_count"] == 4
-    assert data["completed_chunks"] == 4
+    assert data["chunk_count"] == 100
+    assert data["completed_chunks"] == 100
     assert data["progress_percent"] == 100
-    assert peak_active == 4
+    assert peak_active == 100
 
     audio = client.get(data["audio_url"])
     assert audio.status_code == 200
-    assert audio.content == (b"A" * 200) + (b"B" * 200) + (b"C" * 200) + (b"D" * 200)
+    expected = b"".join(chr(65 + (index % 26)).encode("ascii") * 200 for index in range(100))
+    assert audio.content == expected
