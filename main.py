@@ -92,6 +92,18 @@ def init_database() -> None:
         )
         con.execute("CREATE INDEX IF NOT EXISTS idx_jobs_cache_key ON jobs(cache_key)")
         con.execute("CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status, id)")
+        con.execute(
+            """CREATE TABLE IF NOT EXISTS job_segments (
+                job_id INTEGER NOT NULL,
+                segment_index INTEGER NOT NULL,
+                char_count INTEGER NOT NULL,
+                status TEXT NOT NULL,
+                error TEXT,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY(job_id, segment_index)
+            )"""
+        )
+        con.execute("CREATE INDEX IF NOT EXISTS idx_job_segments_job ON job_segments(job_id, segment_index)")
         columns = {row["name"] for row in con.execute("PRAGMA table_info(jobs)").fetchall()}
         if "chunk_count" not in columns:
             con.execute("ALTER TABLE jobs ADD COLUMN chunk_count INTEGER NOT NULL DEFAULT 0")
@@ -227,6 +239,50 @@ def set_job(
         )
 
 
+def replace_job_segments(job_id: int, chunks: list[str]) -> None:
+    """Persist the stable source-order manifest before any segment starts."""
+    now = utc_now()
+    with database() as con:
+        con.execute("DELETE FROM job_segments WHERE job_id=?", (job_id,))
+        con.executemany(
+            """INSERT INTO job_segments
+               (job_id, segment_index, char_count, status, error, updated_at)
+               VALUES (?, ?, ?, ?, NULL, ?)""",
+            [(job_id, index, len(chunk), "queued", now)
+             for index, chunk in enumerate(chunks, start=1)],
+        )
+
+
+def set_job_segment(job_id: int, segment_index: int, status: str, error: str | None = None) -> None:
+    with database() as con:
+        con.execute(
+            """UPDATE job_segments SET status=?, error=?, updated_at=?
+               WHERE job_id=? AND segment_index=?""",
+            (status, error, utc_now(), job_id, segment_index),
+        )
+
+
+def fetch_job_segments(job_id: int) -> list[dict[str, Any]]:
+    with database() as con:
+        rows = con.execute(
+            """SELECT segment_index, char_count, status, error, updated_at
+               FROM job_segments WHERE job_id=? ORDER BY segment_index ASC""",
+            (job_id,),
+        ).fetchall()
+    total = len(rows)
+    return [
+        {
+            "index": int(item["segment_index"]),
+            "label": f"Đoạn {int(item['segment_index']):03d}/{total:03d}",
+            "char_count": int(item["char_count"]),
+            "status": str(item["status"]),
+            "error": item["error"],
+            "updated_at": item["updated_at"],
+        }
+        for item in rows
+    ]
+
+
 def public_job(row: sqlite3.Row, request: Request, *, reused: bool = False) -> dict[str, Any]:
     job_id = int(row["id"])
     status = str(row["status"])
@@ -253,6 +309,7 @@ def public_job(row: sqlite3.Row, request: Request, *, reused: bool = False) -> d
             round(100 * int(row["completed_chunks"] or 0) / int(row["chunk_count"]))
             if int(row["chunk_count"] or 0) else 0
         ),
+        "segments": fetch_job_segments(job_id),
     }
 
 
@@ -358,6 +415,7 @@ async def worker_loop(queue: asyncio.Queue[int]) -> None:
             chunks = split_text_for_tts(str(source_text), TTS_CHUNK_CHAR_LIMIT)
             if not chunks:
                 raise RuntimeError("Không tách được nội dung thành các phần audio.")
+            replace_job_segments(job_id, chunks)
             set_job(job_id, "generating", error=None, chunk_count=len(chunks), completed_chunks=0)
 
             # A job uses up to MAX_PARALLEL_CHUNKS simultaneous Edge-TTS segment syntheses.
@@ -373,10 +431,19 @@ async def worker_loop(queue: asyncio.Queue[int]) -> None:
 
             async def synthesize_part(index: int, text_part: str) -> Path:
                 nonlocal completed_count
-                async with semaphore:
-                    await synthesize_to_file(
-                        text_part, str(row["voice"]), float(row["rate"]), part_paths[index]
-                    )
+                segment_number = index + 1
+                set_job_segment(job_id, segment_number, "generating")
+                try:
+                    async with semaphore:
+                        await synthesize_to_file(
+                            text_part, str(row["voice"]), float(row["rate"]), part_paths[index]
+                        )
+                    if not part_paths[index].is_file() or part_paths[index].stat().st_size < 32:
+                        raise RuntimeError("Đoạn không tạo được tệp MP3 hợp lệ.")
+                except Exception as exc:
+                    set_job_segment(job_id, segment_number, "failed", str(exc)[:1000])
+                    raise
+                set_job_segment(job_id, segment_number, "completed")
                 async with progress_lock:
                     completed_count += 1
                     set_job(job_id, "generating",
@@ -394,14 +461,28 @@ async def worker_loop(queue: asyncio.Queue[int]) -> None:
                     index, error = failures[0]
                     raise RuntimeError(f"Phần {index}/{len(chunks)} thất bại: {error}") from error
 
-                # edge-tts emits the same raw CBR MP3 frame format for all segments.
-                # Concatenate in source order, never in completion order.
+                # Do not begin merging until every manifest row and MP3 part is complete.
+                segment_manifest = fetch_job_segments(job_id)
+                if len(segment_manifest) != len(chunks):
+                    raise RuntimeError("Danh sách đoạn không khớp số đoạn đã tách; từ chối ghép audio.")
+                if [item["index"] for item in segment_manifest] != list(range(1, len(chunks) + 1)):
+                    raise RuntimeError("Thứ tự danh sách đoạn không hợp lệ; từ chối ghép audio.")
+                if any(item["status"] != "completed" for item in segment_manifest):
+                    raise RuntimeError("Vẫn còn đoạn chưa hoàn tất; chưa được phép ghép audio.")
+                if completed_count != len(chunks) or any(
+                    not path.is_file() or path.stat().st_size < 32 for path in part_paths
+                ):
+                    raise RuntimeError("Thiếu MP3 của một hoặc nhiều đoạn; chưa được phép ghép audio.")
+
+                set_job(job_id, "merging", error=None,
+                        chunk_count=len(chunks), completed_chunks=len(chunks))
+                # Merge strictly by the immutable source index, never by finish time.
                 partial_output = output.with_name(output.stem + ".partial.mp3")
                 partial_output.unlink(missing_ok=True)
                 with partial_output.open("wb") as merged:
-                    for part_path in part_paths:
+                    for expected_index, part_path in enumerate(part_paths, start=1):
                         if not part_path.is_file() or part_path.stat().st_size < 32:
-                            raise RuntimeError(f"Thiếu tệp MP3 tạm: {part_path.name}")
+                            raise RuntimeError(f"Thiếu MP3 của đoạn {expected_index}: {part_path.name}")
                         with part_path.open("rb") as part_file:
                             while block := part_file.read(1024 * 1024):
                                 merged.write(block)
