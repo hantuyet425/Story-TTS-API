@@ -35,6 +35,9 @@ VOICES: dict[str, str] = {
 RATES = (0.75, 1.0, 1.25, 1.5, 2.0)
 MAX_QUEUED_JOBS = max(1, int(os.getenv("MAX_QUEUED_JOBS", "50")))
 AUDIO_URL_TTL_SECONDS = max(60, int(os.getenv("AUDIO_URL_TTL_SECONDS", "86400")))
+TTS_CHUNK_CHAR_LIMIT = max(500, int(os.getenv("TTS_CHUNK_CHAR_LIMIT", "5000")))
+MAX_PARALLEL_CHUNKS = min(8, max(1, int(os.getenv("MAX_PARALLEL_CHUNKS", "4"))))
+MAX_INPUT_CHARACTERS = max(5000, int(os.getenv("MAX_INPUT_CHARACTERS", "5000000")))
 QUEUE_POLL_SECONDS = 1.0
 
 
@@ -80,9 +83,15 @@ def init_database() -> None:
         )
         con.execute("CREATE INDEX IF NOT EXISTS idx_jobs_cache_key ON jobs(cache_key)")
         con.execute("CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status, id)")
-        # If the service restarted mid-synthesis, its text is still present.
+        columns = {row["name"] for row in con.execute("PRAGMA table_info(jobs)").fetchall()}
+        if "chunk_count" not in columns:
+            con.execute("ALTER TABLE jobs ADD COLUMN chunk_count INTEGER NOT NULL DEFAULT 0")
+        if "completed_chunks" not in columns:
+            con.execute("ALTER TABLE jobs ADD COLUMN completed_chunks INTEGER NOT NULL DEFAULT 0")
         con.execute(
-            "UPDATE jobs SET status='queued', updated_at=? WHERE status='generating'",
+            """UPDATE jobs
+               SET status='queued', updated_at=?, chunk_count=0, completed_chunks=0
+               WHERE status='generating'""",
             (utc_now(),),
         )
 
@@ -191,16 +200,21 @@ def set_job(
     error: str | None = None,
     audio_path: str | None = None,
     clear_text: bool = False,
+    chunk_count: int | None = None,
+    completed_chunks: int | None = None,
 ) -> None:
     with database() as con:
         con.execute(
             """
             UPDATE jobs
             SET status=?, updated_at=?, error=?, audio_path=COALESCE(?, audio_path),
-                source_text=CASE WHEN ? THEN NULL ELSE source_text END
+                source_text=CASE WHEN ? THEN NULL ELSE source_text END,
+                chunk_count=COALESCE(?, chunk_count),
+                completed_chunks=COALESCE(?, completed_chunks)
             WHERE id=?
             """,
-            (status, utc_now(), error, audio_path, int(clear_text), job_id),
+            (status, utc_now(), error, audio_path, int(clear_text),
+             chunk_count, completed_chunks, job_id),
         )
 
 
@@ -223,15 +237,55 @@ def public_job(row: sqlite3.Row, request: Request, *, reused: bool = False) -> d
         "audio_url": audio_url,
         "download_url": download_url,
         "error": row["error"],
+        "chunk_count": int(row["chunk_count"] or 0),
+        "completed_chunks": int(row["completed_chunks"] or 0),
+        "progress_percent": (
+            100 if status == "completed" else
+            round(100 * int(row["completed_chunks"] or 0) / int(row["chunk_count"]))
+            if int(row["chunk_count"] or 0) else 0
+        ),
     }
 
 
 class TTSRequest(BaseModel):
-    text: str = Field(min_length=1)
+    text: str = Field(min_length=1, max_length=MAX_INPUT_CHARACTERS)
     voice: str = "vi-VN-NamMinhNeural"
     rate: float = 1.0
     chapter_id: str | None = Field(default=None, max_length=300)
 
+
+
+
+def split_text_for_tts(text: str, max_chars: int = TTS_CHUNK_CHAR_LIMIT) -> list[str]:
+    """Split text into bounded segments without losing or reordering characters."""
+    if not isinstance(text, str):
+        raise TypeError("text must be str")
+    if max_chars < 1:
+        raise ValueError("max_chars must be positive")
+    if not text:
+        return []
+    parts: list[str] = []
+    start = 0
+    length = len(text)
+    preferred = ("\\n\\n", "\\n", "。", "！", "？", "!", "?", ".", "；", ";", "，", ",", " ")
+    while start < length:
+        hard_end = min(start + max_chars, length)
+        if hard_end == length:
+            end = length
+        else:
+            min_end = start + max(1, int(max_chars * 0.60))
+            window = text[min_end:hard_end]
+            boundaries = []
+            for marker in preferred:
+                pos = window.rfind(marker)
+                if pos >= 0:
+                    boundaries.append(min_end + pos + len(marker))
+            end = max(boundaries) if boundaries else hard_end
+        if end <= start:
+            end = hard_end
+        parts.append(text[start:end])
+        start = end
+    return parts
 
 async def synthesize_to_file(text: str, voice: str, rate: float, output: Path) -> None:
     edge_percent = round((rate - 1.0) * 100)
@@ -266,6 +320,7 @@ async def synthesize_to_file(text: str, voice: str, rate: float, output: Path) -
 
 
 async def worker_loop(queue: asyncio.Queue[int]) -> None:
+    """Process one AU at a time, with a bounded parallel pool for its segments."""
     while True:
         job_id = await queue.get()
         try:
@@ -279,46 +334,88 @@ async def worker_loop(queue: asyncio.Queue[int]) -> None:
 
             key = str(row["cache_key"])
             output = AUDIO_DIR / f"{key}.mp3"
-            # A previous matching job may have completed while this request waited.
             with database() as con:
                 cached = con.execute(
-                    """
-                    SELECT audio_path FROM jobs
-                    WHERE cache_key=? AND status='completed' AND audio_path IS NOT NULL
-                    ORDER BY id DESC LIMIT 1
-                    """,
+                    """SELECT audio_path FROM jobs
+                       WHERE cache_key=? AND status='completed' AND audio_path IS NOT NULL
+                       ORDER BY id DESC LIMIT 1""",
                     (key,),
                 ).fetchone()
             if cached and Path(cached["audio_path"]).is_file():
-                set_job(job_id, "completed", audio_path=str(cached["audio_path"]), clear_text=True)
+                set_job(job_id, "completed", audio_path=str(cached["audio_path"]),
+                        clear_text=True, chunk_count=1, completed_chunks=1)
                 continue
 
-            set_job(job_id, "generating", error=None)
+            chunks = split_text_for_tts(str(source_text), TTS_CHUNK_CHAR_LIMIT)
+            if not chunks:
+                raise RuntimeError("Không tách được nội dung thành các phần audio.")
+            set_job(job_id, "generating", error=None, chunk_count=len(chunks), completed_chunks=0)
+
+            # A job uses at most four simultaneous Edge-TTS segment syntheses.
+            job_dir = AUDIO_DIR / f".job-{job_id}"
+            if job_dir.exists():
+                import shutil
+                shutil.rmtree(job_dir, ignore_errors=True)
+            job_dir.mkdir(parents=True, exist_ok=True)
+            semaphore = asyncio.Semaphore(MAX_PARALLEL_CHUNKS)
+            progress_lock = asyncio.Lock()
+            completed_count = 0
+            part_paths = [job_dir / f"part-{i:05d}.mp3" for i in range(len(chunks))]
+
+            async def synthesize_part(index: int, text_part: str) -> Path:
+                nonlocal completed_count
+                async with semaphore:
+                    await synthesize_to_file(
+                        text_part, str(row["voice"]), float(row["rate"]), part_paths[index]
+                    )
+                async with progress_lock:
+                    completed_count += 1
+                    set_job(job_id, "generating",
+                            chunk_count=len(chunks), completed_chunks=completed_count)
+                return part_paths[index]
+
             try:
-                await synthesize_to_file(
-                    str(source_text), str(row["voice"]), float(row["rate"]), output
+                outcomes = await asyncio.gather(
+                    *(synthesize_part(i, part) for i, part in enumerate(chunks)),
+                    return_exceptions=True,
                 )
-                set_job(
-                    job_id,
-                    "completed",
-                    audio_path=str(output),
-                    error=None,
-                    clear_text=True,
-                )
-            except Exception as exc:
-                output.unlink(missing_ok=True)
-                output.with_name(output.stem + ".partial" + output.suffix).unlink(missing_ok=True)
-                logger.exception("TTS job %s failed", job_id)
-                set_job(
-                    job_id,
-                    "failed",
-                    error=(str(exc) or exc.__class__.__name__)[:1500],
-                    clear_text=True,
-                )
+                failures = [(i + 1, result) for i, result in enumerate(outcomes)
+                            if isinstance(result, BaseException)]
+                if failures:
+                    index, error = failures[0]
+                    raise RuntimeError(f"Phần {index}/{len(chunks)} thất bại: {error}") from error
+
+                # edge-tts emits the same raw CBR MP3 frame format for all segments.
+                # Concatenate in source order, never in completion order.
+                partial_output = output.with_name(output.stem + ".partial.mp3")
+                partial_output.unlink(missing_ok=True)
+                with partial_output.open("wb") as merged:
+                    for part_path in part_paths:
+                        if not part_path.is_file() or part_path.stat().st_size < 32:
+                            raise RuntimeError(f"Thiếu tệp MP3 tạm: {part_path.name}")
+                        with part_path.open("rb") as part_file:
+                            while block := part_file.read(1024 * 1024):
+                                merged.write(block)
+                if partial_output.stat().st_size < 128:
+                    raise RuntimeError("Tệp MP3 ghép cuối cùng rỗng hoặc không hợp lệ.")
+                os.replace(partial_output, output)
+                set_job(job_id, "completed", audio_path=str(output), error=None,
+                        clear_text=True, chunk_count=len(chunks), completed_chunks=len(chunks))
+            finally:
+                import shutil
+                shutil.rmtree(job_dir, ignore_errors=True)
+                output.with_name(output.stem + ".partial.mp3").unlink(missing_ok=True)
+
         except asyncio.CancelledError:
             raise
-        except Exception:
-            logger.exception("Unexpected worker error for job %s", job_id)
+        except Exception as exc:
+            logger.exception("TTS job %s failed", job_id)
+            try:
+                set_job(job_id, "failed",
+                        error=(str(exc) or exc.__class__.__name__)[:1500],
+                        clear_text=True)
+            except Exception:
+                logger.exception("Unable to save failure for TTS job %s", job_id)
         finally:
             queue.task_done()
 
