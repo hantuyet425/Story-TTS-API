@@ -59,6 +59,9 @@ Typical response (\`202 Accepted\`):
   "voice": "vi-VN-NamMinhNeural",
   "voice_name": "Nam Minh",
   "rate": 1.25,
+  "chunk_count": 0,
+  "completed_chunks": 0,
+  "progress_percent": 0,
   "cache_hit": false,
   "reused_request": false,
   "status_url": "https://your-tts-api.example/v1/jobs/12",
@@ -137,16 +140,19 @@ This repository includes \`render.yaml\`. In Render choose **New → Blueprint**
 - Store the same generated \`TTS_API_KEY\` as a server-side secret on the reader site's backend.
 - Never expose the API key in the browser or commit it to Git.
 
-The blueprint uses a persistent disk and a paid-style service plan; check current Render pricing before creating it. This application intentionally runs as **one server worker** because its queue is in-process and state lives in SQLite on a single disk.
+The blueprint uses a persistent disk and a paid-style service plan; check current Render pricing before creating it. This application intentionally runs as **one server process/worker** because its durable job queue is currently in-process and state lives in SQLite on a single disk. Segment synthesis is parallelized asynchronously inside that one worker.
 
 ## Cache, queue, and limits
 
 - Completed MP3s are cached by exact chapter text + voice + speed. Changing any of these produces a different cache key.
 - Identical pending requests share the existing job, preventing duplicate work for the same chapter and options.
-- Jobs are synthesized one at a time to reduce pressure on the upstream TTS service.
-- The API does not split a chapter into separate MP3 files and has no application-level character-count cap. Edge-TTS handles protocol-level fragments internally; the upstream service may still reject unusually long input.
+- Each submitted AU is split at paragraph/sentence boundaries into segments of at most **5,000 characters**. The completed segments are merged back into **one MP3 per AU**, in the original source order.
+- Up to **4 segments are synthesized concurrently per AU** by default (`MAX_PARALLEL_CHUNKS=4`). The API queue still processes parent AU jobs one at a time, so the global segment concurrency remains bounded.
+- Job status reports `chunk_count`, `completed_chunks` and `progress_percent`; the desktop app can display real segment progress instead of a guessed percentage.
+- Edge-TTS itself splits each request internally by a **4,096-byte** protocol threshold. These application-level 5,000-character segments are separate parallel requests; they are not a replacement for Edge-TTS's protocol splitter.
+- `TTS_CHUNK_CHAR_LIMIT` defaults to 5,000. `MAX_PARALLEL_CHUNKS` defaults to 4 and can be reduced to 2 or 1 if the upstream service starts throttling. `MAX_INPUT_CHARACTERS` defaults to 5,000,000 characters per AU request.
 - \`MAX_QUEUED_JOBS\` defaults to 50. When the queue is full, the API responds with HTTP 429 and \`Retry-After: 30\`.
-- The service retries temporary synthesis errors, but cannot guarantee the external Edge TTS service will accept every request. A 429 can mean upstream rate limiting; a 403 can indicate a protocol change.
+- Each segment is retried independently. The service cannot guarantee the external Edge TTS service will accept every request. A 429 can mean upstream rate limiting; a 403 can indicate a protocol/handshake change. If four-way synthesis is unreliable, set `MAX_PARALLEL_CHUNKS=2` or `1` in the service environment and redeploy.
 - Generated audio and SQLite state are stored under \`TTS_DATA_DIR\`, default \`./data\`. Use persistent storage in deployment and back up this directory if the cache is valuable.
 - Signed audio URLs expire after 24 hours by default (\`AUDIO_URL_TTL_SECONDS\`). A fresh URL is returned when the authenticated website polls the job endpoint again.
 - The API stores the chapter text only while waiting or synthesizing; it clears text from the job row once synthesis succeeds or fails. Do not log chapter text or secrets.
