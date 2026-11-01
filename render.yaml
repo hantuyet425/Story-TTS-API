@@ -24,7 +24,7 @@ services:
       - key: TTS_CHUNK_CHAR_LIMIT
         value: "5000"
       - key: MAX_PARALLEL_CHUNKS
-        value: "4"
+        value: "100"
       - key: MAX_INPUT_CHARACTERS
         value: "5000000"
       - key: AUDIO_URL_TTL_SECONDS
