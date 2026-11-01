@@ -39,7 +39,13 @@ RATES = (0.75, 1.0, 1.25, 1.5, 2.0)
 MAX_QUEUED_JOBS = max(1, int(os.getenv("MAX_QUEUED_JOBS", "50")))
 AUDIO_URL_TTL_SECONDS = max(60, int(os.getenv("AUDIO_URL_TTL_SECONDS", "86400")))
 TTS_CHUNK_CHAR_LIMIT = max(500, int(os.getenv("TTS_CHUNK_CHAR_LIMIT", "5000")))
-MAX_PARALLEL_CHUNKS = min(8, max(1, int(os.getenv("MAX_PARALLEL_CHUNKS", "4"))))
+def parallel_chunk_limit(value: str | int | None = None) -> int:
+    """Return a safe configured per-job concurrency, clamped to 1..100."""
+    raw = os.getenv("MAX_PARALLEL_CHUNKS", "100") if value is None else value
+    return min(100, max(1, int(raw)))
+
+
+MAX_PARALLEL_CHUNKS = parallel_chunk_limit()
 MAX_INPUT_CHARACTERS = max(5000, int(os.getenv("MAX_INPUT_CHARACTERS", "5000000")))
 QUEUE_POLL_SECONDS = 1.0
 
@@ -354,7 +360,7 @@ async def worker_loop(queue: asyncio.Queue[int]) -> None:
                 raise RuntimeError("Không tách được nội dung thành các phần audio.")
             set_job(job_id, "generating", error=None, chunk_count=len(chunks), completed_chunks=0)
 
-            # A job uses at most four simultaneous Edge-TTS segment syntheses.
+            # A job uses up to MAX_PARALLEL_CHUNKS simultaneous Edge-TTS segment syntheses.
             job_dir = AUDIO_DIR / f".job-{job_id}"
             if job_dir.exists():
                 import shutil
